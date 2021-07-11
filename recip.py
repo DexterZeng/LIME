@@ -8,138 +8,9 @@ import keras
 from tqdm import *
 import numpy as np
 from utils import *
-from CSLS import *
 import tensorflow as tf
-import keras.backend as K
-from keras.layers import *
-from layer import NR_GraphAttention
-from keras import activations, constraints, initializers, regularizers
 from scipy.stats import rankdata
 from collections import defaultdict
-class TokenEmbedding(keras.layers.Embedding):
-    """Embedding layer with weights returned."""
-
-    def compute_output_shape(self, input_shape):
-        return self.input_dim, self.output_dim
-
-    def compute_mask(self, inputs, mask=None):
-        return None
-
-    def call(self, inputs):
-        return self.embeddings
-
-
-def get_embedding():
-    inputs = [adj_matrix, r_index, r_val, rel_matrix, ent_matrix]
-    inputs = [np.expand_dims(item, axis=0) for item in inputs]
-    return get_emb.predict_on_batch(inputs)
-
-
-def test(wrank=None):
-    vec = get_embedding()
-    return get_hits(vec, dev_pair, wrank=wrank)
-
-
-def CSLS_test(thread_number=16, csls=10, accurate=True):
-    vec = get_embedding()
-    Lvec = np.array([vec[e1] for e1, e2 in dev_pair])
-    Rvec = np.array([vec[e2] for e1, e2 in dev_pair])
-    Lvec = Lvec / np.linalg.norm(Lvec, axis=-1, keepdims=True)
-    Rvec = Rvec / np.linalg.norm(Rvec, axis=-1, keepdims=True)
-    eval_alignment_by_sim_mat(Lvec, Rvec, [1, 5, 10], thread_number, csls=csls, accurate=accurate)
-    np.save(args.data_dir + '/vec.npy', vec)
-    return None
-
-
-def recip(thread_number=16, csls=10, accurate=True):
-    vec = get_embedding()
-    Lvec = np.array([vec[e1] for e1, e2 in dev_pair])
-    Rvec = np.array([vec[e2] for e1, e2 in dev_pair])
-    Lvec = Lvec / np.linalg.norm(Lvec, axis=-1, keepdims=True)
-    Rvec = Rvec / np.linalg.norm(Rvec, axis=-1, keepdims=True)
-
-    eval_alignment_by_sim_mat(Lvec, Rvec, [1, 5, 10], thread_number, csls=csls, accurate=accurate)
-    np.save(args.data_dir + '/vec.npy', vec)
-    return None
-
-
-def get_train_set(batch_size):
-    negative_ratio = batch_size // len(train_pair) + 1
-    train_set = np.reshape(np.repeat(np.expand_dims(train_pair, axis=0), axis=0, repeats=negative_ratio),
-                           newshape=(-1, 2))
-    np.random.shuffle(train_set)
-    train_set = train_set[:batch_size]
-    train_set = np.concatenate([train_set, np.random.randint(0, node_size, train_set.shape)], axis=-1)
-    return train_set
-
-
-def get_trgat(node_size, rel_size, node_hidden, rel_hidden, triple_size, n_attn_heads=2, dropout_rate=0, gamma=3,
-              lr=0.005, depth=2):
-    adj_input = Input(shape=(None, 2))
-    index_input = Input(shape=(None, 2), dtype='int64')
-    val_input = Input(shape=(None,))
-    rel_adj = Input(shape=(None, 2))
-    ent_adj = Input(shape=(None, 2))
-
-    ent_emb = TokenEmbedding(node_size, node_hidden, trainable=True)(
-        val_input)  # do not care about the input, just obtain embeddings..
-    rel_emb = TokenEmbedding(rel_size, node_hidden, trainable=True)(val_input)
-
-    def avg(tensor, size):
-        adj = K.cast(K.squeeze(tensor[0], axis=0), dtype="int64")  # 数据类型转换
-        adj = tf.SparseTensor(indices=adj, values=tf.ones_like(adj[:, 0], dtype='float32'),
-                              dense_shape=(node_size, size))
-        adj = tf.sparse_softmax(adj)
-        return tf.sparse_tensor_dense_matmul(adj, tensor[1])
-
-    opt = [rel_emb, adj_input, index_input, val_input]
-
-    ent_feature = Lambda(avg, arguments={'size': node_size})(
-        [ent_adj, ent_emb])  # 初始化为相邻节点和自己的embeddings的平均值 对于每一个ent, 其周围ent信息
-    rel_feature = Lambda(avg, arguments={'size': rel_size})(
-        [rel_adj, rel_emb])  # 初始化为相邻节点和自己的embeddings的平均值 对于每一个ent，其周围rel信息
-
-    encoder = NR_GraphAttention(node_size, activation="relu",
-                                rel_size=rel_size,
-                                depth=depth,
-                                attn_heads=n_attn_heads,
-                                triple_size=triple_size,
-                                attn_heads_reduction='average',
-                                dropout_rate=dropout_rate)
-
-    out_feature = Concatenate(-1)([encoder([ent_feature] + opt), encoder([rel_feature] + opt)])
-    out_feature = Dropout(dropout_rate)(out_feature)
-
-    alignment_input = Input(shape=(None, 4))
-    find = Lambda(lambda x: K.gather(reference=x[0], indices=K.cast(K.squeeze(x[1], axis=0), 'int32')))(
-        [out_feature, alignment_input])
-
-    def align_loss(tensor):
-        def _cosine(x):
-            dot1 = K.batch_dot(x[0], x[1], axes=1)
-            dot2 = K.batch_dot(x[0], x[0], axes=1)
-            dot3 = K.batch_dot(x[1], x[1], axes=1)
-            max_ = K.maximum(K.sqrt(dot2 * dot3), K.epsilon())
-            return dot1 / max_
-
-        def l1(ll, rr):
-            return K.sum(K.abs(ll - rr), axis=-1, keepdims=True)
-
-        def l2(ll, rr):
-            return K.sum(K.square(ll - rr), axis=-1, keepdims=True)
-
-        l, r, fl, fr = [tensor[:, 0, :], tensor[:, 1, :], tensor[:, 2, :], tensor[:, 3, :]]
-        loss = K.relu(gamma + l1(l, r) - l1(l, fr)) + K.relu(gamma + l1(l, r) - l1(fl, r))
-        return tf.reduce_sum(loss, keep_dims=True) / (batch_size)
-
-    loss = Lambda(align_loss)(find)
-
-    inputs = [adj_input, index_input, val_input, rel_adj, ent_adj]
-    train_model = keras.Model(inputs=inputs + [alignment_input], outputs=loss)
-    train_model.compile(loss=lambda y_true, y_pred: y_pred, optimizer=keras.optimizers.rmsprop(lr))
-
-    feature_model = keras.Model(inputs=inputs, outputs=out_feature)
-    return train_model, feature_model
 
 
 def make_print_to_file(fileName, path='./'):
@@ -205,28 +76,17 @@ def gen_adMtrx_more(x, y, rows, columns, aep_fuse):
     return adMtrx1
 
 def BFS(graph, vertex):
-    # 使用列表作为队列
     queue = []
-    # 将首个节点添加到队列中
     queue.append(vertex)
-    # 使用集合来存放已访问过的节点
     looked = set()
-    # 将首个节点添加到集合中表示已访问
     looked.add(vertex)
-    # 当队列不为空时进行遍历
     while (len(queue) > 0):
-        # 从队列头部取出一个节点并查询该节点的相邻节点
         temp = queue.pop(0)
         nodes = graph[temp]
-        # 遍历该节点的所有相邻节点
         for w in nodes:
-            # 判断节点是否存在于已访问集合中,即是否已被访问过
             if w not in looked:
-                # 若未被访问,则添加到队列中,同时添加到已访问集合中,表示已被访问
                 queue.append(w)
                 looked.add(w)
-        #print(temp, end=' ')
-    # print(len(looked))
     return looked
 
 def get_blocks(adMtrx, allents):
@@ -246,13 +106,8 @@ def get_blocks(adMtrx, allents):
         lenghs.append(len(matched))
         if len(matched) == 1:
             count1 += 1
-        # print()
-    # print(blocks)
     print('Total blocks: ' + str(len(blocks)))
-    # print(lenghs)
     print('Total blocks with length 1: ' + str(count1))
-    # print(count1)
-    # print(lenghs[0])
     return blocks
 
 def reciprocal(sim_mat):
@@ -462,7 +317,35 @@ def eva_sm_1(sim_mat, sim_mat1):
     print('accuracy： ' + str(float(trueC) / thr))
     print("total time elapsed: {:.4f} s".format(time.time() - t))
 
+
+def eva(sim_mat, use_min = False):
+    if use_min is True:
+        predicted = np.argmin(sim_mat, axis=1)
+    else:
+        predicted = np.argmax(sim_mat, axis=1)
+    cor = predicted == np.array(range(sim_mat.shape[0]))
+    cor_num = np.sum(cor)
+    print("Acc: " + str(cor_num) + ' / ' + str(len(cor)) + ' = ' + str(cor_num*1.0/len(cor)))
+
+def csls_sim__(sim_mat, k):
+    nearest_values1 = calculate_nearest_k(sim_mat, k)
+    nearest_values2 = calculate_nearest_k(sim_mat.T, k)
+    csls_sim_mat = 2 * sim_mat.T - nearest_values1
+    csls_sim_mat = csls_sim_mat.T - nearest_values2
+    return csls_sim_mat
+
+def calculate_nearest_k(sim_mat, k):
+    sorted_mat = -np.partition(-sim_mat, k + 1, axis=1)  # -np.sort(-sim_mat1)
+    nearest_k = sorted_mat[:, 0:k]
+    return np.mean(nearest_k, axis=1)
+
+def csls_sim_as(sim_mat):
+    nearest_values2 = np.max(sim_mat.T, axis=1)
+    csls_sim_mat = sim_mat - nearest_values2
+    return csls_sim_mat
+
 import argparse
+import time
 
 if __name__ == '__main__':
     parser = argparse.ArgumentParser()
@@ -470,14 +353,9 @@ if __name__ == '__main__':
     # dbp_yg zh_en ja_en fr_en en_fr en_de dbp_wd dbp_yg
     parser.add_argument("--data_dir", type=str, default="data/en_fr", required=False,
                         help="input dataset file directory, ('data/DBP15K/zh_en', 'data/DWY100K/dbp_wd')")
-    parser.add_argument("--ratio", type=float, default=0.3, help="the ratio for training")  # 0.2
+    parser.add_argument("--method", type=str, default="ralign", help="inference strategies, ralign, ralign-wr, ralign-pb, dalign")  # 0.2
     args = parser.parse_args()
 
-    make_print_to_file(args.data_dir.split('/')[-1] + '_' + str(args.ratio), path='./logs/')
-
-    print(args)
-
-    os.environ["CUDA_VISIBLE_DEVICES"] = "0"
     os.environ["TF_CPP_MIN_LOG_LEVEL"] = "2"
     tf.compat.v1.logging.set_verbosity(tf.compat.v1.logging.ERROR)
 
@@ -486,55 +364,121 @@ if __name__ == '__main__':
     sess = tf.Session(config=config)
 
     lang = args.data_dir
-    train_pair, dev_pair, adj_matrix, r_index, r_val, adj_features, rel_features = load_data('./%s/' % lang,
-                                                                                             train_ratio=args.ratio)
+    train_pair, dev_pair, adj_matrix, r_index, r_val, adj_features, rel_features = load_data('./%s/' % lang)
 
     vec = np.load(args.data_dir + '/vec.npy')
     Lvec = np.array([vec[e1] for e1, e2 in dev_pair])
     Rvec = np.array([vec[e2] for e1, e2 in dev_pair])
 
-
-    # Lvec = Lvec / np.linalg.norm(Lvec, axis=-1, keepdims=True)
-    # Rvec = Rvec / np.linalg.norm(Rvec, axis=-1, keepdims=True)
-    # thread_number = 16; csls = 10; accurate = True
-    # eval_alignment_by_sim_mat(Lvec, Rvec, [1, 5, 10], thread_number, csls=csls, accurate=accurate)
-
-    def eva(sim_mat, use_min = False):
-        if use_min is True:
-            predicted = np.argmin(sim_mat, axis=1)
-        else:
-            predicted = np.argmax(sim_mat, axis=1)
-        cor = predicted == np.array(range(sim_mat.shape[0]))
-        cor_num = np.sum(cor)
-        print("Acc: " + str(cor_num) + ' / ' + str(len(cor)) + ' = ' + str(cor_num*1.0/len(cor)))
-
-    def csls_sim__(sim_mat, k):
-        nearest_values1 = calculate_nearest_k(sim_mat, k)
-        nearest_values2 = calculate_nearest_k(sim_mat.T, k)
-        csls_sim_mat = 2 * sim_mat.T - nearest_values1
-        csls_sim_mat = csls_sim_mat.T - nearest_values2
-        return csls_sim_mat
-
-    def calculate_nearest_k(sim_mat, k):
-        sorted_mat = -np.partition(-sim_mat, k + 1, axis=1)  # -np.sort(-sim_mat1)
-        nearest_k = sorted_mat[:, 0:k]
-        return np.mean(nearest_k, axis=1)
-
-    def csls_sim_as(sim_mat):
-        nearest_values2 = np.max(sim_mat.T, axis=1)
-        csls_sim_mat = sim_mat - nearest_values2
-        return csls_sim_mat
-
-    import time
-
     t_total = time.time()
     Lvec = Lvec / np.linalg.norm(Lvec, axis=-1, keepdims=True)
     Rvec = Rvec / np.linalg.norm(Rvec, axis=-1, keepdims=True)
     sim_mat = np.matmul(Lvec, Rvec.T)
-    # eva(sim_mat)
-    # eva_sm(sim_mat)
 
+    if args.method == "dalign":
+        eva(sim_mat)
+    elif args.method == "ralign-wr":
+        sim_mat_r = sim_mat.T
 
+        sim_mat = csls_sim_as(sim_mat)
+        sim_mat_r = csls_sim_as(sim_mat_r)
+
+        print("total time elapsed: {:.4f} s".format(time.time() - t_total))
+
+        recip_sim = (sim_mat + sim_mat_r.T) / 2.0
+        eva(recip_sim)
+        print("total time elapsed: {:.4f} s".format(time.time() - t_total))
+    elif args.method == "ralign":
+        sim_mat_r = sim_mat.T
+
+        sim_mat = csls_sim_as(sim_mat)
+        sim_mat_r = csls_sim_as(sim_mat_r)
+
+        print("total time elapsed: {:.4f} s".format(time.time() - t_total))
+
+        recip_sim = (sim_mat + sim_mat_r.T) / 2.0
+        eva(recip_sim)
+        print("total time elapsed: {:.4f} s".format(time.time() - t_total))
+
+        ranks = rankdata(-sim_mat, method="average", axis=1) # ordinal dense min max average
+        ranks_r = rankdata(-sim_mat_r, method="average", axis=1)
+        rankfused = (ranks + ranks_r.T) / 2
+        eva(rankfused, True)
+        print("total time elapsed: {:.4f} s".format(time.time() - t_total))
+    elif args.method == "ralign-pb":
+        #progressive blocking
+        recip_flag = True
+        t = time.time()
+        aep_fuse = sim_mat  # should be the similarity score
+        row_max = np.max(aep_fuse, axis=1)
+        Thres = [np.percentile(row_max, 50), np.percentile(row_max, 25), np.percentile(row_max, 1)]
+        print(Thres)
+        print("total time elapsed: {:.4f} s".format(time.time() - t_total))
+
+        thres = Thres[0]
+        x, y = np.where(aep_fuse > thres)
+        adMtrx = gen_adMtrx(x, y, aep_fuse)
+
+        allents = set()
+        for i in range(aep_fuse.shape[0] + aep_fuse.shape[1]):
+            allents.add(i)
+        blocks = get_blocks(adMtrx, allents)
+        del adMtrx
+        del allents
+        del x, y
+        # evaluation!!!!
+        maxtruth = 0
+        correct_coun = 0
+
+        all1s, maxtruth, correct_coun = ana_blocks(blocks, aep_fuse, maxtruth, correct_coun, recip_flag)
+
+        rows, columns, tempM = dirtect_process(maxtruth, correct_coun, all1s, aep_fuse, False,
+                                               recip_flag)
+        print('Lagrest block... (all 1s): ' + str(len(all1s)))
+        del all1s
+
+        print('\n*********************************************************')
+        thres2 = Thres[1]
+        x, y = np.where(tempM > thres2)
+        adMtrx1 = gen_adMtrx_more(x, y, rows, columns, aep_fuse)
+
+        allents = []
+        allents.extend(rows)
+        for item in columns:
+            allents.append(item + aep_fuse.shape[0])
+        allents = set(allents)
+        newblocks = get_blocks(adMtrx1, allents)
+        del adMtrx1
+        del allents
+
+        all1s_new, maxtruth, correct_coun = ana_blocks(newblocks, aep_fuse, maxtruth, correct_coun, recip_flag)
+
+        rows, columns, tempM = dirtect_process(maxtruth, correct_coun, all1s_new, aep_fuse, False, recip_flag)
+        print('Lagrest block... (all 1s): ' + str(len(all1s_new)))
+        del all1s_new
+
+        print('\n**********************************************************')
+        thres2 = Thres[2]
+        x, y = np.where(tempM > thres2)
+        adMtrx1 = gen_adMtrx_more(x, y, rows, columns, aep_fuse)
+
+        allents = []
+        allents.extend(rows)
+        for item in columns:
+            allents.append(item + aep_fuse.shape[0])
+        allents = set(allents)
+
+        newblocks = get_blocks(adMtrx1, allents)
+        del adMtrx1
+        del allents
+
+        all1s_new, maxtruth, correct_coun = ana_blocks(newblocks, aep_fuse, maxtruth, correct_coun, recip_flag)
+
+        rows, columns, tempM = dirtect_process(maxtruth, correct_coun, all1s_new, aep_fuse, True, recip_flag)
+
+        print("total time elapsed: {:.4f} s".format(time.time() - t_total))
+
+# eva_sm(sim_mat)
     # csls_sim_mat = csls_sim__(sim_mat, 10)
     # eva(csls_sim_mat)
     # print("total time elapsed: {:.4f} s".format(time.time() - t_total))
@@ -563,139 +507,9 @@ if __name__ == '__main__':
     #     weight_string = 0
     # sim_mat = (sim_mat * weight_stru + aep_n * weight_text + str_sim * weight_string)
 
-    sim_mat_r = sim_mat.T
-
-    eva(sim_mat)
-    print("total time elapsed: {:.4f} s".format(time.time() - t_total))
-
-    sim_mat = csls_sim_as(sim_mat)
-    sim_mat_r = csls_sim_as(sim_mat_r)
-
-    recip_sim = (sim_mat + sim_mat_r.T) / 2.0
-    eva(recip_sim)
-    print("total time elapsed: {:.4f} s".format(time.time() - t_total))
-
-    eva_sm_1(sim_mat, sim_mat_r)
 
 
-    # ranks = rankdata(-sim_mat, method="average", axis=1) # ordinal dense min max average
-    # ranks_r = rankdata(-sim_mat_r, method="average", axis=1)
-    # rankfused = (ranks + ranks_r.T) / 2
-    # eva(rankfused, True)
-    # print("total time elapsed: {:.4f} s".format(time.time() - t_total))
-    # eva_sm(-rankfused)
 
-    # #progressive blocking
-    # recip_flag = True
-    # t = time.time()
-    # aep_fuse = sim_mat  # should be the similarity score
-    # row_max = np.max(aep_fuse, axis=1)
-    # Thres = [np.percentile(row_max, 40), np.percentile(row_max, 20), np.percentile(row_max, 1)]
-    # print(Thres)
-    # print("total time elapsed: {:.4f} s".format(time.time() - t_total))
-    #
-    # thres = Thres[0]
-    # x, y = np.where(aep_fuse > thres)
-    # adMtrx = gen_adMtrx(x, y, aep_fuse)
-    #
-    # allents = set()
-    # for i in range(aep_fuse.shape[0] + aep_fuse.shape[1]):
-    #     allents.add(i)
-    # blocks = get_blocks(adMtrx, allents)
-    # del adMtrx
-    # del allents
-    # del x, y
-    # # evaluation!!!!
-    # maxtruth = 0
-    # correct_coun = 0
-    #
-    # all1s, maxtruth, correct_coun = ana_blocks(blocks, aep_fuse, maxtruth, correct_coun, recip_flag)
-    #
-    # rows, columns, tempM = dirtect_process(maxtruth, correct_coun, all1s, aep_fuse, False,
-    #                                        recip_flag)
-    # print('Lagrest block... (all 1s): ' + str(len(all1s)))
-    # del all1s
-    #
-    # print('\n*********************************************************')
-    # thres2 = Thres[1]
-    # x, y = np.where(tempM > thres2)
-    # adMtrx1 = gen_adMtrx_more(x, y, rows, columns, aep_fuse)
-    #
-    # allents = []
-    # allents.extend(rows)
-    # for item in columns:
-    #     allents.append(item + aep_fuse.shape[0])
-    # allents = set(allents)
-    # newblocks = get_blocks(adMtrx1, allents)
-    # del adMtrx1
-    # del allents
-    #
-    # all1s_new, maxtruth, correct_coun = ana_blocks(newblocks, aep_fuse, maxtruth, correct_coun, recip_flag)
-    #
-    # rows, columns, tempM = dirtect_process(maxtruth, correct_coun, all1s_new, aep_fuse, False, recip_flag)
-    # print('Lagrest block... (all 1s): ' + str(len(all1s_new)))
-    # del all1s_new
-    #
-    # print('\n**********************************************************')
-    # thres2 = Thres[2]
-    # x, y = np.where(tempM > thres2)
-    # adMtrx1 = gen_adMtrx_more(x, y, rows, columns, aep_fuse)
-    #
-    # allents = []
-    # allents.extend(rows)
-    # for item in columns:
-    #     allents.append(item + aep_fuse.shape[0])
-    # allents = set(allents)
-    #
-    # newblocks = get_blocks(adMtrx1, allents)
-    # del adMtrx1
-    # del allents
-    #
-    # all1s_new, maxtruth, correct_coun = ana_blocks(newblocks, aep_fuse, maxtruth, correct_coun, recip_flag)
-    #
-    # rows, columns, tempM = dirtect_process(maxtruth, correct_coun, all1s_new, aep_fuse, False, recip_flag)
-    #
-    # print("total time elapsed: {:.4f} s".format(time.time() - t_total))
-    #
-    # print('\n**********************************************************')
-    # thres2 = 0.5
-    # x, y = np.where(tempM > thres2)
-    # adMtrx1 = gen_adMtrx_more(x, y, rows, columns, aep_fuse)
-    #
-    # allents = []
-    # allents.extend(rows)
-    # for item in columns:
-    #     allents.append(item + aep_fuse.shape[0])
-    # allents = set(allents)
-    #
-    # newblocks = get_blocks(adMtrx1, allents)
-    # del adMtrx1
-    # del allents
-    #
-    # all1s_new, maxtruth, correct_coun = ana_blocks(newblocks, aep_fuse, maxtruth, correct_coun, recip_flag)
-    #
-    # rows, columns, tempM = dirtect_process(maxtruth, correct_coun, all1s_new, aep_fuse, False, recip_flag)
-    #
-    # print("total time elapsed: {:.4f} s".format(time.time() - t_total))
-    #
-    # print('\n**********************************************************')
-    # thres2 = 0.4
-    # x, y = np.where(tempM > thres2)
-    # adMtrx1 = gen_adMtrx_more(x, y, rows, columns, aep_fuse)
-    #
-    # allents = []
-    # allents.extend(rows)
-    # for item in columns:
-    #     allents.append(item + aep_fuse.shape[0])
-    # allents = set(allents)
-    #
-    # newblocks = get_blocks(adMtrx1, allents)
-    # del adMtrx1
-    # del allents
-    #
-    # all1s_new, maxtruth, correct_coun = ana_blocks(newblocks, aep_fuse, maxtruth, correct_coun, recip_flag)
-    #
-    # rows, columns, tempM = dirtect_process(maxtruth, correct_coun, all1s_new, aep_fuse, True, recip_flag)
-    #
-    # print("total time elapsed: {:.4f} s".format(time.time() - t_total))
+
+
 

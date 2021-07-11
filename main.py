@@ -406,9 +406,8 @@ if __name__ == '__main__':
     parser.add_argument("--ratio", type=float, default=0.3, help="the ratio for training")  # 0.2
     args = parser.parse_args()
 
-    make_print_to_file(args.data_dir.split('/')[-1]  + '_' + str(args.ratio), path='./logs/')
-
-    print(args)
+    # make_print_to_file(args.data_dir.split('/')[-1]  + '_' + str(args.ratio), path='./logs/')
+    # print(args)
 
     os.environ["CUDA_VISIBLE_DEVICES"] = "0"
     os.environ["TF_CPP_MIN_LOG_LEVEL"]="2"
