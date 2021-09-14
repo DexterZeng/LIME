@@ -156,121 +156,6 @@ class NR_GraphAttention(Layer):
         node_shape = self.node_size, (input_shape[0][-1]) * (self.depth + 1)
         return node_shape
 
-def div_list(ls, n):
-    ls_len = len(ls)
-    if n <= 0 or 0 == ls_len:
-        return [ls]
-    if n > ls_len:
-        return [ls]
-    elif n == ls_len:
-        return [[i] for i in ls]
-    else:
-        j = ls_len // n
-        k = ls_len % n
-        ls_return = []
-        for i in range(0, (n - 1) * j, j):
-            ls_return.append(ls[i:i + j])
-        ls_return.append(ls[(n - 1) * j:])
-        return ls_return
-
-def cal_csls_sim(sim_mat, k):
-    sorted_mat = -np.partition(-sim_mat, k + 1, axis=1)  # -np.sort(-sim_mat1)
-    nearest_k = sorted_mat[:, 0:k]
-    sim_values = np.mean(nearest_k, axis=1)
-    return sim_values
-
-def CSLS_sim(sim_mat1, k, nums_threads):
-    tasks = div_list(np.array(range(sim_mat1.shape[0])), nums_threads)
-    pool = multiprocessing.Pool(processes=len(tasks))
-    reses = list()
-    for task in tasks:
-        reses.append(pool.apply_async(cal_csls_sim, (sim_mat1[task, :], k)))
-    pool.close()
-    pool.join()
-    sim_values = None
-    for res in reses:
-        val = res.get()
-        if sim_values is None:
-            sim_values = val
-        else:
-            sim_values = np.append(sim_values, val)
-    assert sim_values.shape[0] == sim_mat1.shape[0]
-    return sim_values
-
-def sim_handler(embed1, embed2, k, nums_threads):
-    sim_mat = np.matmul(embed1, embed2.T)
-    if k <= 0:
-        print("k = 0")
-        return sim_mat
-    csls1 = CSLS_sim(sim_mat, k, nums_threads)
-    csls2 = CSLS_sim(sim_mat.T, k, nums_threads)
-    csls_sim_mat = 2 * sim_mat.T - csls1
-    csls_sim_mat = csls_sim_mat.T - csls2
-    del sim_mat
-    gc.collect()
-    return csls_sim_mat
-
-def cal_rank_by_sim_mat(task, sim, top_k, accurate):
-    mean = 0
-    mrr = 0
-    num = [0 for k in top_k]
-    prec_set = set()
-    for i in range(len(task)):
-        ref = task[i]
-        if accurate:
-            rank = (-sim[i, :]).argsort()
-        else:
-            rank = np.argpartition(-sim[i, :], np.array(top_k) - 1)
-        prec_set.add((ref, rank[0]))
-        assert ref in rank
-        rank_index = np.where(rank == ref)[0][0]
-        mean += (rank_index + 1)
-        mrr += 1 / (rank_index + 1)
-        for j in range(len(top_k)):
-            if rank_index < top_k[j]:
-                num[j] += 1
-    return mean, mrr, num, prec_set
-
-def eval_alignment_by_sim_mat(embed1, embed2, top_k, nums_threads, csls=0, accurate=False,output = True):
-    t = time.time()
-    sim_mat = sim_handler(embed1, embed2, csls, nums_threads)
-    ref_num = sim_mat.shape[0]
-    t_num = [0 for k in top_k]
-    t_mean = 0
-    t_mrr = 0
-    t_prec_set = set()
-    tasks = div_list(np.array(range(ref_num)), nums_threads)
-    pool = multiprocessing.Pool(processes=len(tasks))
-    reses = list()
-    for task in tasks:
-        reses.append(pool.apply_async(cal_rank_by_sim_mat, (task, sim_mat[task, :], top_k, accurate)))
-    pool.close()
-    pool.join()
-
-    for res in reses:
-        mean, mrr, num, prec_set = res.get()
-        t_mean += mean
-        t_mrr += mrr
-        t_num += np.array(num)
-        t_prec_set |= prec_set
-    assert len(t_prec_set) == ref_num
-    acc = np.array(t_num) / ref_num * 100
-    for i in range(len(acc)):
-        acc[i] = round(acc[i], 2)
-    t_mean /= ref_num
-    t_mrr /= ref_num
-    if output:
-        if accurate:
-            print("accurate results: hits@{} = {}, mr = {:.3f}, mrr = {:.3f}, time = {:.3f} s ".format(top_k, acc, t_mean,
-                                                                                                       t_mrr,
-                                                                                                       time.time() - t))
-        else:
-            print("hits@{} = {}, time = {:.3f} s ".format(top_k, acc, time.time() - t))
-    hits1 = acc[0]
-    del sim_mat
-    gc.collect()
-    return t_prec_set, hits1
-
 def get_embedding():
     inputs = [adj_matrix, r_index, r_val, rel_matrix, ent_matrix]
     inputs = [np.expand_dims(item, axis=0) for item in inputs]
@@ -279,29 +164,8 @@ def get_embedding():
 
 def test(wrank=None):
     vec = get_embedding()
+    np.save(args.data_dir + '/vec.npy', vec)
     return get_hits(vec, dev_pair, wrank=wrank)
-
-
-def CSLS_test(thread_number=16, csls=10, accurate=True):
-    vec = get_embedding()
-    Lvec = np.array([vec[e1] for e1, e2 in dev_pair])
-    Rvec = np.array([vec[e2] for e1, e2 in dev_pair])
-    Lvec = Lvec / np.linalg.norm(Lvec, axis=-1, keepdims=True)
-    Rvec = Rvec / np.linalg.norm(Rvec, axis=-1, keepdims=True)
-    eval_alignment_by_sim_mat(Lvec, Rvec, [1, 5, 10], thread_number, csls=csls, accurate=accurate)
-    np.save(args.data_dir + '/vec.npy', vec)
-    return None
-
-def recip(thread_number=16, csls=10, accurate=True):
-    vec = get_embedding()
-    Lvec = np.array([vec[e1] for e1, e2 in dev_pair])
-    Rvec = np.array([vec[e2] for e1, e2 in dev_pair])
-    Lvec = Lvec / np.linalg.norm(Lvec, axis=-1, keepdims=True)
-    Rvec = Rvec / np.linalg.norm(Rvec, axis=-1, keepdims=True)
-    eval_alignment_by_sim_mat(Lvec, Rvec, [1, 5, 10], thread_number, csls=csls, accurate=accurate)
-    np.save(args.data_dir + '/vec.npy', vec)
-    return None
-
 
 def get_train_set(batch_size):
     negative_ratio = batch_size // len(train_pair) + 1
@@ -313,8 +177,7 @@ def get_train_set(batch_size):
     return train_set
 
 
-def get_trgat(node_size, rel_size, node_hidden, rel_hidden, triple_size, n_attn_heads=2, dropout_rate=0, gamma=3,
-              lr=0.005, depth=2):
+def get_trgat(node_size, rel_size, node_hidden, rel_hidden, triple_size, n_attn_heads=2, dropout_rate=0, gamma=3, lr=0.005, depth=2):
     adj_input = Input(shape=(None, 2))
     index_input = Input(shape=(None, 2), dtype='int64')
     val_input = Input(shape=(None,))
@@ -378,26 +241,6 @@ def get_trgat(node_size, rel_size, node_hidden, rel_hidden, triple_size, n_attn_
     feature_model = keras.Model(inputs=inputs, outputs=out_feature)
     return train_model, feature_model
 
-def make_print_to_file(fileName, path='./'):
-    import sys
-    import os
-    import sys
-    import datetime
-
-    class Logger(object):
-        def __init__(self, filename="Default.log", path="./"):
-            self.terminal = sys.stdout
-            self.log = open(os.path.join(path, filename), "a", encoding='utf8',)
-
-        def write(self, message):
-            self.terminal.write(message)
-            self.log.write(message)
-
-        def flush(self):
-            pass
-    sys.stdout = Logger(fileName + '.log', path=path)
-    print(fileName.center(60,'*'))
-
 import argparse
 if __name__ == '__main__':
     parser = argparse.ArgumentParser()
@@ -405,9 +248,6 @@ if __name__ == '__main__':
     parser.add_argument("--data_dir", type=str, default="data/en_de", required=False, help="input dataset file directory, ('data/DBP15K/zh_en', 'data/DWY100K/dbp_wd')")
     parser.add_argument("--ratio", type=float, default=0.3, help="the ratio for training")  # 0.2
     args = parser.parse_args()
-
-    # make_print_to_file(args.data_dir.split('/')[-1]  + '_' + str(args.ratio), path='./logs/')
-    # print(args)
 
     os.environ["CUDA_VISIBLE_DEVICES"] = "0"
     os.environ["TF_CPP_MIN_LOG_LEVEL"]="2"
@@ -446,4 +286,4 @@ if __name__ == '__main__':
         inputs = [np.expand_dims(item, axis=0) for item in inputs]
         model.train_on_batch(inputs, np.zeros((1, 1)))
         if i % 300 == 299:
-            CSLS_test()
+            test()

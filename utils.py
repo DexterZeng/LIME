@@ -1,5 +1,7 @@
 import numpy as np
 import scipy.sparse as sp
+from collections import defaultdict
+import time
 import scipy
 import tensorflow as tf
 import os
@@ -156,3 +158,214 @@ def get_hits(vec, test_pair, wrank = None, top_k=(1, 5, 10)):
     for i in range(len(top_rl)):
         print('Hits@%d: %.2f%%' % (top_k[i], top_rl[i] / len(test_pair) * 100))
     print('MRR: %.3f' % (MRR_rl / Rvec.shape[0]))
+
+
+# for recip.py
+
+def csls_sim__(sim_mat, k):
+    nearest_values1 = calculate_nearest_k(sim_mat, k)
+    nearest_values2 = calculate_nearest_k(sim_mat.T, k)
+    csls_sim_mat = 2 * sim_mat.T - nearest_values1
+    csls_sim_mat = csls_sim_mat.T - nearest_values2
+    return csls_sim_mat
+
+def calculate_nearest_k(sim_mat, k):
+    sorted_mat = -np.partition(-sim_mat, k + 1, axis=1)  # -np.sort(-sim_mat1)
+    nearest_k = sorted_mat[:, 0:k]
+    return np.mean(nearest_k, axis=1)
+
+def gen_adMtrx(x, y, aep_fuse):
+    adMtrx = dict()
+    for i in range(len(x)):
+        x_ele = x[i]
+        y_ele = y[i] + aep_fuse.shape[0]
+        if x_ele not in adMtrx:
+            ents = []
+        else:
+            ents = adMtrx[x_ele]
+        ents.append(y_ele)
+        adMtrx[x_ele] = ents
+        if y_ele not in adMtrx:
+            ents = []
+        else:
+            ents = adMtrx[y_ele]
+        ents.append(x_ele)
+        adMtrx[y_ele] = ents
+    return adMtrx
+
+def gen_adMtrx_more(x, y, rows, columns, aep_fuse):
+    adMtrx1 = dict()
+    for i in range(len(x)):
+        x_ele = rows[x[i]]
+        y_ele = columns[y[i]] + aep_fuse.shape[0]
+        if x_ele not in adMtrx1:
+            ents = []
+        else:
+            ents = adMtrx1[x_ele]
+        ents.append(y_ele)
+
+        adMtrx1[x_ele] = ents
+
+        if y_ele not in adMtrx1:
+            ents = []
+        else:
+            ents = adMtrx1[y_ele]
+        ents.append(x_ele)
+        adMtrx1[y_ele] = ents
+    return adMtrx1
+
+
+def BFS(graph, vertex):
+    queue = []
+    queue.append(vertex)
+    looked = set()
+    looked.add(vertex)
+    while (len(queue) > 0):
+        temp = queue.pop(0)
+        nodes = graph[temp]
+        for w in nodes:
+            if w not in looked:
+                queue.append(w)
+                looked.add(w)
+    return looked
+
+def get_blocks(adMtrx, allents):
+    count1 = 0
+    Graph = adMtrx
+    leftents = allents
+    blocks = []
+    lenghs = []
+    while len(leftents) > 0:
+        vertex = list(leftents)[0]
+        if vertex in Graph:
+            matched = BFS(Graph, vertex)
+        else:
+            matched = {vertex}
+        leftents = leftents.difference(matched)
+        blocks.append(matched)
+        lenghs.append(len(matched))
+        if len(matched) == 1:
+            count1 += 1
+    print('Total blocks: ' + str(len(blocks)))
+    print('Total blocks with length 1: ' + str(count1))
+    return blocks
+
+def male_without_match(matches, males):
+    for male in males:
+        if male not in matches:
+            return male
+
+def deferred_acceptance(male_prefs, female_prefs):
+    female_queue = defaultdict(int)
+    males = list(male_prefs.keys())
+    matches = {}
+    while True:
+        male = male_without_match(matches, males)
+        # print(male)
+        if male is None:
+            break
+        female_index = female_queue[male]
+        female_queue[male] += 1
+        # print(female_index)
+
+        try:
+            female = male_prefs[male][female_index]
+        except IndexError:
+            matches[male] = male
+            continue
+        # print('Trying %s with %s... ' % (male, female), end='')
+        prev_male = matches.get(female, None)
+        if not prev_male:
+            matches[male] = female
+            matches[female] = male
+            # print('auto')
+        elif female_prefs[female].index(male) < \
+             female_prefs[female].index(prev_male):
+            matches[male] = female
+            matches[female] = male
+            del matches[prev_male]
+            # print('matched')
+        # else:
+            # print('rejected')
+    return {male: matches[male] for male in male_prefs.keys()}
+
+def eva_sm(sim_mat):
+    t = time.time()
+    print('stable matching...')
+    thr = 10500
+    thr2 = 10500
+
+    scale = sim_mat.shape[0]
+    # store preferences
+    MALE_PREFS = {}
+    FEMALE_PREFS = {}
+    pref = np.argsort(-sim_mat[:scale, :scale], axis=1)
+    print("Generate the preference scores time elapsed: {:.4f} s".format(time.time() - t))
+
+    for i in range(scale):
+        lis = (pref[i] + thr2).tolist()
+        MALE_PREFS[i] = lis
+    print("Forming the preference scores time 1 elapsed: {:.4f} s".format(time.time() - t))
+    del pref
+
+    pref_col = np.argsort(-sim_mat[:scale, :scale], axis=0)
+    print("Generate the preference scores time elapsed: {:.4f} s".format(time.time() - t))
+
+    for i in range(scale):
+        FEMALE_PREFS[i + thr2] = pref_col[:, i].tolist()
+    print("Forming the preference scores time 2 elapsed: {:.4f} s".format(time.time() - t))
+    del pref_col
+
+    matches = deferred_acceptance(MALE_PREFS, FEMALE_PREFS)
+    del MALE_PREFS
+    del FEMALE_PREFS
+    print("Deferred acceptance time elapsed: {:.4f} s".format(time.time() - t))
+
+    # print(matches)
+    trueC = 0
+    for match in matches:
+        if match + thr2 == matches[match]:
+            trueC += 1
+    print('accuracy： ' + str(float(trueC) / thr))
+    print("total time elapsed: {:.4f} s".format(time.time() - t))
+
+
+def eva_sm_1(sim_mat, sim_mat1):
+    t = time.time()
+    print('stable matching...')
+    thr = 10500
+    thr2 = 10500
+
+    scale = sim_mat.shape[0]
+    # store preferences
+    MALE_PREFS = {}
+    FEMALE_PREFS = {}
+    pref = np.argsort(-sim_mat[:scale, :scale], axis=1)
+    print("Generate the preference scores time elapsed: {:.4f} s".format(time.time() - t))
+
+    for i in range(scale):
+        lis = (pref[i] + thr2).tolist()
+        MALE_PREFS[i] = lis
+    print("Forming the preference scores time 1 elapsed: {:.4f} s".format(time.time() - t))
+    del pref
+
+    pref_col = np.argsort(-sim_mat1[:scale, :scale], axis=1)
+    print("Generate the preference scores time elapsed: {:.4f} s".format(time.time() - t))
+
+    for i in range(scale):
+        FEMALE_PREFS[i + thr2] = pref_col[i].tolist()
+    print("Forming the preference scores time 2 elapsed: {:.4f} s".format(time.time() - t))
+    del pref_col
+
+    matches = deferred_acceptance(MALE_PREFS, FEMALE_PREFS)
+    del MALE_PREFS
+    del FEMALE_PREFS
+    print("Deferred acceptance time elapsed: {:.4f} s".format(time.time() - t))
+
+    # print(matches)
+    trueC = 0
+    for match in matches:
+        if match + thr2 == matches[match]:
+            trueC += 1
+    print('accuracy： ' + str(float(trueC) / thr))
+    print("total time elapsed: {:.4f} s".format(time.time() - t))
